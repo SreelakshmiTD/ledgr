@@ -147,3 +147,34 @@ explicit `format="ISO8601"`, which handles both shapes. This was only caught
 by running the full pipeline end-to-end across all 9 shards — the earlier
 single-shard testing (`shard_0000`, `shard_0001`, `shard_0004`) happened not
 to contain that edge case, so it passed cleanly despite the latent bug.
+
+## Known limitation: pricing accuracy is a separate gap from injection-formula validity
+
+`config/pricing.yaml` (`src/pricing.py`) has its own, distinct limitation from
+the "Known limitation: validation scope" section above — worth stating
+explicitly so the two don't get conflated as "the same disclosed
+approximation" when they're not:
+
+- **Injection-formula validity** (this ADR, above) is about whether the
+  harness-anchored, clipped-relative-risk *formula* realistically models how
+  real-world LLM failures behave. No amount of testing inside this codebase
+  can resolve that — it's a modeling judgment call, checked against the
+  formula's own output, not against independent ground truth.
+- **Pricing accuracy** is a *sourcing* problem, not a modeling one: it's
+  about whether the dollar figures in `pricing.yaml` are the right number for
+  a well-defined question ("what does this exact model, billed through this
+  exact vendor, actually cost per token"). Unlike the injection formula, this
+  one *is* independently checkable against the real world, and one instance
+  of it being wrong was caught and fixed directly: `pricing.yaml` originally
+  priced `DeepSeek-V3.2`, `Kimi-K2.5`, and `gpt-5.2-2025-12-11` using each
+  model's own direct vendor API pricing, but the dataset's own `provider`
+  column (`attributes.gen_ai.provider.name`) shows all three are actually
+  billed through `azure.ai.openai` — a different vendor with its own rate
+  card. Corrected by researching Azure AI Foundry/Azure OpenAI Service
+  pricing specifically; total cost changed by +6.29% ($31,670.37 ->
+  $33,663.00) as a result. Even after that correction, `pricing.yaml`'s own
+  `pricing_source_note` per model still discloses real remaining gaps
+  (third-party trackers instead of vendor pages, a retired model's
+  last-known price, Azure's rate card lagging a recent OpenAI price cut) —
+  those are sourcing-confidence caveats, not injection-formula-style
+  business judgment calls.
