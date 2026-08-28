@@ -1,0 +1,74 @@
+# Model pricing for src/pricing.py's calculate_cost().
+#
+# Kept separate from config/failure_rates.yaml on purpose: failure rates are
+# fixed, published statistics from the Exgentic dataset card (facts about a
+# static dataset). Pricing is live external market data that changes on its
+# own schedule regardless of the dataset -- mixing the two would make it look
+# like pricing is as authoritative/fixed as the dataset-card numbers, which
+# it isn't.
+#
+# Researched via web search on 2026-08-28 (this session's current date).
+# Confidence is noted per model in pricing_source_note -- these come from
+# pricing trackers/aggregators cross-referencing vendor rate cards, not from
+# fetching each vendor's own pricing page directly (Claude Opus 4.5 is the
+# exception: sourced straight from Anthropic's own announcement). Treat all
+# of these as approximate public pricing, not guaranteed exact -- several of
+# these model names/versions don't have one single canonical, easily
+# verifiable public price.
+
+model_pricing:
+  DeepSeek-V3.2:
+    provider: deepseek
+    input_token_price_per_million: 0.2088
+    output_token_price_per_million: 0.3096
+    pricing_source_note: >
+      APPROXIMATED, lower confidence. DeepSeek-V3.2 was retired and
+      superseded by DeepSeek V4-Flash/V4-Pro on 2026-07-24, so there is no
+      live official price for this exact model anymore -- this is its
+      last-known rate before retirement, from OpenRouter's cross-provider
+      aggregate (not DeepSeek's own platform page). Treat as a rough
+      historical approximation, not a current quote.
+
+  Kimi-K2.5:
+    provider: moonshotai
+    input_token_price_per_million: 0.60
+    output_token_price_per_million: 3.00
+    pricing_source_note: >
+      Moderate-high confidence. Exact model name match ("Kimi K2.5") on
+      Moonshot's own platform pricing per a tracker explicitly dated
+      August 2026 (current). Sourced via a third-party tracker citing
+      Moonshot's docs, not fetched directly from moonshot.ai.
+
+  claude-opus-4-5:
+    provider: anthropic
+    input_token_price_per_million: 5.00
+    output_token_price_per_million: 25.00
+    pricing_source_note: >
+      HIGH confidence. Sourced directly from Anthropic's own launch
+      announcement (anthropic.com/news/claude-opus-4-5), exact model
+      match, official primary source.
+
+  gemini-3-pro-preview:
+    provider: google
+    input_token_price_per_million: 2.00
+    output_token_price_per_million: 12.00
+    pricing_source_note: >
+      High confidence for the standard tier, exact model name match
+      ("gemini-3-pro-preview", not the newer 3.1 preview) across multiple
+      trackers. Caveat: this is the <=200K-token-context rate; prompts
+      over 200K context bill at $4.00/$18.00 per million instead. This
+      config does not have per-request context length, so all rows use
+      the standard-tier rate -- a known simplification, not an oversight.
+
+  gpt-5.2-2025-12-11:
+    provider: openai
+    input_token_price_per_million: 0.88
+    output_token_price_per_million: 7.00
+    pricing_source_note: >
+      APPROXIMATED, moderate confidence. GPT-5.2 released 2025-12-10 per
+      trackers, a one-day difference from this dataset's model string
+      ("...2025-12-11") that's most likely a release-vs-GA date
+      discrepancy rather than a different model. Pricing itself has been
+      volatile -- input price reportedly fell 50% (from $1.75 to $0.875)
+      over the ~90 days before this was researched -- so treat this as a
+      snapshot, not a stable long-term rate.
