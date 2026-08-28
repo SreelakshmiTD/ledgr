@@ -121,3 +121,29 @@ combination this targets):
 - The `[0.5, 2.0]` bound is a chosen sanity range, not a documented dataset
   statistic — same disclosure principle as the anchor+multiplier design
   itself: an explicit, defensible approximation, not a fabricated precision.
+
+## Known limitation: validation scope
+
+The actual-vs-expected drift checks performed throughout this build (per-shard,
+then full-dataset) confirm that the RNG sampling correctly matches the computed
+`injection_probability` values — i.e. that the code samples Bernoulli draws
+correctly at scale. That is an engineering-correctness claim, not a model
+one. It does **not** validate that the harness-anchored, clipped-relative-risk
+formula itself is a realistic model of how real-world LLM API failures
+actually behave — that is a business/statistical judgment no amount of
+drift-checking against the formula's own output can establish, since the
+"expected" value being checked against is derived from the same formula being
+tested. These are two different claims, and only the first has been tested.
+
+## Timestamp parsing bug
+
+The full 9-shard `inject_all_shards()` run initially crashed inside
+`pd.to_datetime()` on `start_time`/`end_time`. A handful of real timestamps
+in `shard_0003` and `shard_0005` land on exactly zero microseconds and are
+recorded without a fractional-seconds suffix (e.g. `...T16:09:33+00:00`
+instead of `...T16:09:33.000000+00:00`), which pandas' format-inference
+can't parse in the same pass as the microsecond-bearing majority. Fixed with
+explicit `format="ISO8601"`, which handles both shapes. This was only caught
+by running the full pipeline end-to-end across all 9 shards — the earlier
+single-shard testing (`shard_0000`, `shard_0001`, `shard_0004`) happened not
+to contain that edge case, so it passed cleanly despite the latent bug.
