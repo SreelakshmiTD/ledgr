@@ -178,3 +178,7 @@ approximation" when they're not:
   last-known price, Azure's rate card lagging a recent OpenAI price cut) —
   those are sourcing-confidence caveats, not injection-formula-style
   business judgment calls.
+
+## Minor corrections log
+
+- `output_message_length` was inherited unchanged onto synthetic rows instead of being zeroed alongside `output_tokens`; found during data dictionary review, fixed in `inject_synthetic_retries()`, no effect on `execution_cost_usd` totals.

@@ -203,6 +203,7 @@ def inject_synthetic_retries(df, failure_rates_config, random_seed=42, verbose=T
     error_index = np.minimum((error_draws * len(ERROR_TYPES)).astype(int), len(ERROR_TYPES) - 1)
     synthetic["error_type"] = np.array(ERROR_TYPES)[error_index]
     synthetic["output_tokens"] = 0
+    synthetic["output_message_length"] = 0
     synthetic["start_time"] = [t.isoformat(timespec="microseconds") for t in synth_start_dt]
     synthetic["end_time"] = [t.isoformat(timespec="microseconds") for t in synth_end_dt]
     synthetic["is_synthetic_retry"] = True
