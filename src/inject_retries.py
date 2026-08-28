@@ -1,6 +1,7 @@
 import gc
 import glob
 import os
+import zlib
 
 import numpy as np
 import pandas as pd
@@ -39,6 +40,36 @@ def _extract_calibration(failure_rates_config):
         "retry_duration_bounds": tuple(calibration["retry_duration_seconds"]),
         "retry_buffer_bounds": tuple(calibration["retry_buffer_seconds"]),
     }
+
+
+def _stable_uniform(keys, seed, purpose):
+    """
+    Deterministic per-row uniform draw in [0, 1), keyed by (seed, purpose,
+    key) rather than by position in an array.
+
+    The previous version used a single np.random.default_rng(seed) stream
+    consumed in row order (rng.random(len(real)), then rng.uniform(...) for
+    timing, then rng.choice(...) for error_type). That only reproduces the
+    same result if row order never changes -- a future pandas version, a
+    reordered json_normalize, or splitting shard processing across parallel
+    workers would all silently produce different injected rows under "the
+    same seed". Hashing each row's own call_id instead makes the draw a
+    pure function of that row's identity: reordering, re-running on a
+    subset, or processing shards in a different sequence all leave each
+    row's own draw unchanged.
+
+    Not cryptographic -- zlib.crc32 is fast and deterministic across
+    processes/platforms, which is all this needs (unlike Python's built-in
+    hash(), which is randomized per-process for strings unless
+    PYTHONHASHSEED is fixed). `purpose` keys separate draws (selection,
+    duration, buffer, error_type) off the same call_id so they don't move
+    in lockstep.
+    """
+    def draw(key):
+        digest = zlib.crc32(f"{seed}:{purpose}:{key}".encode())
+        return digest / 2**32
+
+    return keys.map(draw)
 
 
 def _require_mapped(real, harness_rates, model_rates):
@@ -110,8 +141,6 @@ def inject_synthetic_retries(df, failure_rates_config, random_seed=42, verbose=T
     Takes the flattened call-level DataFrame and injects synthetic failed-retry
     spans, calibrated jointly on harness AND model, not just harness alone.
     """
-    rng = np.random.default_rng(random_seed)
-
     harness_rates = failure_rates_config["harness_failure_rates"]
     model_rates = failure_rates_config["model_failure_rates"]
     mean_model_rate = sum(model_rates.values()) / len(model_rates)
@@ -127,7 +156,7 @@ def inject_synthetic_retries(df, failure_rates_config, random_seed=42, verbose=T
         real["harness"], real["model"], harness_rates, model_rates, mean_model_rate, calibration
     )
 
-    draws = rng.random(len(real))
+    draws = _stable_uniform(real["call_id"], random_seed, "select").to_numpy()
     selected_mask = draws < injection_probability.to_numpy()
     selected_idx = real.index[selected_mask]
     n_selected = len(selected_idx)
@@ -140,6 +169,8 @@ def inject_synthetic_retries(df, failure_rates_config, random_seed=42, verbose=T
     start_dt = pd.to_datetime(real["start_time"], format="ISO8601")
     end_dt = pd.to_datetime(real["end_time"], format="ISO8601")
 
+    selected_call_ids = real.loc[selected_idx, "call_id"]
+
     # Duration is generated first, and the pre-offset gap is derived from it
     # (duration + a positive buffer) rather than drawn independently. Retries
     # are serialized -- attempt 0 must fully finish before attempt 1 starts --
@@ -151,8 +182,12 @@ def inject_synthetic_retries(df, failure_rates_config, random_seed=42, verbose=T
     # always strictly before real_start since buffer > 0.
     duration_lo, duration_hi = calibration["retry_duration_bounds"]
     buffer_lo, buffer_hi = calibration["retry_buffer_bounds"]
-    synth_duration = rng.uniform(duration_lo, duration_hi, size=n_selected)
-    buffer = rng.uniform(buffer_lo, buffer_hi, size=n_selected)
+    synth_duration = duration_lo + _stable_uniform(selected_call_ids, random_seed, "duration").to_numpy() * (
+        duration_hi - duration_lo
+    )
+    buffer = buffer_lo + _stable_uniform(selected_call_ids, random_seed, "buffer").to_numpy() * (
+        buffer_hi - buffer_lo
+    )
     pre_offset_gap = synth_duration + buffer
 
     sel_start_dt = start_dt.loc[selected_idx]
@@ -164,7 +199,9 @@ def inject_synthetic_retries(df, failure_rates_config, random_seed=42, verbose=T
         "_attempt_1", "_attempt_0", regex=False
     )
     synthetic["status_code"] = SYNTHETIC_STATUS_CODE
-    synthetic["error_type"] = rng.choice(ERROR_TYPES, size=n_selected)
+    error_draws = _stable_uniform(selected_call_ids, random_seed, "error_type").to_numpy()
+    error_index = np.minimum((error_draws * len(ERROR_TYPES)).astype(int), len(ERROR_TYPES) - 1)
+    synthetic["error_type"] = np.array(ERROR_TYPES)[error_index]
     synthetic["output_tokens"] = 0
     synthetic["start_time"] = [t.isoformat(timespec="microseconds") for t in synth_start_dt]
     synthetic["end_time"] = [t.isoformat(timespec="microseconds") for t in synth_end_dt]
