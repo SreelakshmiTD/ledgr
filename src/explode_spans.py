@@ -5,6 +5,7 @@ import resource
 import time
 
 import pandas as pd
+import psutil
 
 from load_raw import get_shard_paths, load_shard
 
@@ -15,6 +16,17 @@ def _peak_rss_mb():
     """Rough peak RSS in MB. ru_maxrss is bytes on macOS, KB on Linux."""
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return peak / (1024 * 1024) if platform.system() == "Darwin" else peak / 1024
+
+
+def _current_rss_mb():
+    """
+    Live current RSS in MB, via psutil. ru_maxrss alone is a monotonic
+    high-water mark -- it can only prove memory usage never got worse than
+    some point, never that del+gc.collect() actually freed anything between
+    shards. Reporting current RSS alongside peak makes that rise-and-fall
+    pattern across shards actually visible.
+    """
+    return psutil.Process().memory_info().rss / (1024 * 1024)
 
 
 def _col(flat, name):
@@ -94,7 +106,7 @@ def process_shard(shard_path):
     print(
         f"  {os.path.basename(shard_path)}: "
         f"{session_count} sessions -> {len(result)} spans "
-        f"| peak RSS so far: {_peak_rss_mb():.0f} MB"
+        f"| current RSS: {_current_rss_mb():.0f} MB | peak RSS so far: {_peak_rss_mb():.0f} MB"
     )
 
     return result

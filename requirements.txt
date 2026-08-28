@@ -23,6 +23,7 @@ numpy==2.5.2
 packaging==26.3
 pandas==3.0.5
 propcache==0.5.2
+psutil==7.2.2
 py4j==0.10.9.9
 pyarrow==25.0.1
 pyspark==4.2.0
