@@ -15,29 +15,51 @@
 # of these as approximate public pricing, not guaranteed exact -- several of
 # these model names/versions don't have one single canonical, easily
 # verifiable public price.
+#
+# 2026-08-28 correction: the dataset's own 'provider' column
+# (attributes.gen_ai.provider.name) shows DeepSeek-V3.2, Kimi-K2.5, and
+# gpt-5.2-2025-12-11 are actually billed through azure.ai.openai (Azure AI
+# Foundry), not each vendor's own direct API -- the original version of this
+# file priced the wrong billing vendor for those three. provider: below now
+# reflects who bills for the call, not who makes the model, matching the
+# dataset's own field. Azure-specific pricing was searched for and found for
+# all three (moderate confidence -- see each note; Microsoft's own pricing
+# page renders prices via JS/region picker and couldn't be scraped directly,
+# so these are third-party trackers of Azure's rate card, not Azure's page
+# itself). See docs/adr/0001-... for how this differs from the separate,
+# earlier-documented injection-formula-vs-reality validation gap.
 
 model_pricing:
   DeepSeek-V3.2:
-    provider: deepseek
-    input_token_price_per_million: 0.2088
-    output_token_price_per_million: 0.3096
+    provider: azure.ai.openai
+    input_token_price_per_million: 0.580
+    output_token_price_per_million: 1.68
     pricing_source_note: >
-      APPROXIMATED, lower confidence. DeepSeek-V3.2 was retired and
-      superseded by DeepSeek V4-Flash/V4-Pro on 2026-07-24, so there is no
-      live official price for this exact model anymore -- this is its
-      last-known rate before retirement, from OpenRouter's cross-provider
-      aggregate (not DeepSeek's own platform page). Treat as a rough
-      historical approximation, not a current quote.
+      APPROXIMATED, moderate confidence. Billed via Azure AI Foundry per
+      the dataset's own provider field. Azure-specific pricing was found
+      (a dedicated Azure AI Foundry pricing tracker, "last verified 2026-06-02")
+      and is meaningfully higher than DeepSeek's own direct-API rate
+      ($0.2088/$0.3096) -- roughly 2.8x input, 5.4x output -- consistent
+      with Azure AI Foundry marketplace markup over the vendor's own
+      price. Could not verify directly against Microsoft's own pricing
+      page (azure.microsoft.com renders these figures via JS/region
+      selector, not visible in a plain fetch). Also, the underlying
+      DeepSeek-V3.2 model was retired/superseded by V4-Flash/V4-Pro on
+      2026-07-24, so this is a last-known rate before retirement either way.
 
   Kimi-K2.5:
-    provider: moonshotai
+    provider: azure.ai.openai
     input_token_price_per_million: 0.60
     output_token_price_per_million: 3.00
     pricing_source_note: >
-      Moderate-high confidence. Exact model name match ("Kimi K2.5") on
-      Moonshot's own platform pricing per a tracker explicitly dated
-      August 2026 (current). Sourced via a third-party tracker citing
-      Moonshot's docs, not fetched directly from moonshot.ai.
+      Moderate-high confidence. Billed via Azure AI Foundry per the
+      dataset's own provider field. Checked Azure-specific pricing
+      directly (not just carried over from Moonshot's direct price): two
+      independent Azure AI Foundry trackers ("last verified 2026-08-06")
+      show the identical $0.60/$3.00 rate as Moonshot's own platform --
+      here Azure appears to pass through the vendor's list price
+      unchanged, unlike DeepSeek-V3.2 above. Still sourced via
+      third-party trackers, not fetched directly from Azure's own page.
 
   claude-opus-4-5:
     provider: anthropic
@@ -61,14 +83,19 @@ model_pricing:
       the standard-tier rate -- a known simplification, not an oversight.
 
   gpt-5.2-2025-12-11:
-    provider: openai
-    input_token_price_per_million: 0.88
-    output_token_price_per_million: 7.00
+    provider: azure.ai.openai
+    input_token_price_per_million: 1.75
+    output_token_price_per_million: 14.00
     pricing_source_note: >
-      APPROXIMATED, moderate confidence. GPT-5.2 released 2025-12-10 per
-      trackers, a one-day difference from this dataset's model string
-      ("...2025-12-11") that's most likely a release-vs-GA date
-      discrepancy rather than a different model. Pricing itself has been
-      volatile -- input price reportedly fell 50% (from $1.75 to $0.875)
-      over the ~90 days before this was researched -- so treat this as a
-      snapshot, not a stable long-term rate.
+      APPROXIMATED, moderate confidence. Billed via Azure OpenAI Service
+      per the dataset's own provider field. Azure's list rate ($1.75/$14.00)
+      is exactly 2x OpenAI's own direct-API rate ($0.88/$7.00) -- almost
+      certainly because Azure's rate card hasn't caught up to OpenAI's
+      recent direct-API price cut (input reportedly fell 50%, from $1.75
+      to $0.875, over the ~90 days before this was researched -- Azure's
+      $1.75 matches the OLD pre-cut price exactly). Also carries the
+      original one-day date discrepancy: GPT-5.2 released 2025-12-10 per
+      trackers vs. this dataset's "...2025-12-11" model string, most
+      likely a release-vs-GA date difference rather than a different
+      model. Treat as a snapshot, not a stable long-term rate -- Azure
+      may catch up to OpenAI's lower price at any time.
