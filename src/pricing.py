@@ -8,6 +8,8 @@ import yaml
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "pricing.yaml")
 PROCESSED_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
 
+REQUIRED_RATE_KEYS = ("input_token_price_per_million", "output_token_price_per_million")
+
 
 def _load_pricing_config():
     with open(CONFIG_PATH) as f:
@@ -22,7 +24,10 @@ def calculate_cost(input_tokens, output_tokens, model, pricing_config):
     Fails loud on an unmapped model -- raises ValueError naming it -- rather
     than silently defaulting to $0 or an average price, same pattern as the
     unmapped-model fix in inject_retries.py's _require_mapped(). A missing
-    price should be visible, not quietly absorbed into a wrong total.
+    price should be visible, not quietly absorbed into a wrong total. Same
+    treatment for a model that IS present but has a malformed entry (missing
+    one of the two required rate keys, e.g. a config typo) -- raises a
+    clear, named ValueError instead of a bare KeyError.
 
     input_tokens/output_tokens may be None or NaN (a synthetic failed row's
     output_tokens is legitimately 0; some real rows have NaN token counts
@@ -34,6 +39,12 @@ def calculate_cost(input_tokens, output_tokens, model, pricing_config):
         raise ValueError(f"pricing config is missing a rate for model: {model!r}")
 
     rates = model_pricing[model]
+    missing_keys = [key for key in REQUIRED_RATE_KEYS if key not in rates]
+    if missing_keys:
+        raise ValueError(
+            f"pricing config entry for model {model!r} is missing required key(s): {missing_keys}"
+        )
+
     input_tokens = 0 if pd.isna(input_tokens) else input_tokens
     output_tokens = 0 if pd.isna(output_tokens) else output_tokens
 
