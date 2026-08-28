@@ -46,7 +46,17 @@ def _require_priced(models, pricing_config):
     """Fail fast, before any per-row computation, if a model in the data
     has no price in pricing_config -- same upfront-check shape as
     inject_retries.py's _require_mapped(), so a missing price is caught
-    immediately rather than mid-.apply() partway through a shard."""
+    immediately rather than mid-.apply() partway through a shard.
+
+    Checks for null models first, before building the unmapped-set: a
+    mixed set of NaN and genuinely-unmapped string models would otherwise
+    reach sorted(unmapped) below, which raises a confusing TypeError
+    ('<' not supported between instances of 'float' and 'str') instead of
+    a clear ValueError -- the exact edge case inject_retries.py's
+    _require_mapped() already guards against with this same ordering."""
+    if models.isna().any():
+        raise ValueError("Found null model values with no known price.")
+
     unmapped = set(models.unique()) - set(pricing_config["model_pricing"].keys())
     if unmapped:
         raise ValueError(
