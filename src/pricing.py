@@ -55,9 +55,14 @@ def calculate_cost(input_tokens, output_tokens, model, pricing_config):
 
 def _require_priced(models, pricing_config):
     """Fail fast, before any per-row computation, if a model in the data
-    has no price in pricing_config -- same upfront-check shape as
-    inject_retries.py's _require_mapped(), so a missing price is caught
+    has no price in pricing_config, or has a malformed entry (missing one
+    of the two required rate keys) -- same upfront-check shape as
+    inject_retries.py's _require_mapped(), so a bad price is caught
     immediately rather than mid-.apply() partway through a shard.
+    calculate_cost() also checks for malformed entries on its own (so a
+    direct call still fails loud), but only this upfront pass catches it
+    before ANY row has been processed -- calculate_cost()'s check alone
+    would let earlier rows in the same .apply() call succeed first.
 
     Checks for null models first, before building the unmapped-set: a
     mixed set of NaN and genuinely-unmapped string models would otherwise
@@ -68,10 +73,23 @@ def _require_priced(models, pricing_config):
     if models.isna().any():
         raise ValueError("Found null model values with no known price.")
 
-    unmapped = set(models.unique()) - set(pricing_config["model_pricing"].keys())
+    model_pricing = pricing_config["model_pricing"]
+    unique_models = set(models.unique())
+
+    unmapped = unique_models - set(model_pricing.keys())
     if unmapped:
         raise ValueError(
             f"model_pricing in config/pricing.yaml is missing a rate for: {sorted(unmapped)}"
+        )
+
+    malformed = {
+        model: [key for key in REQUIRED_RATE_KEYS if key not in model_pricing[model]]
+        for model in sorted(unique_models)
+    }
+    malformed = {model: keys for model, keys in malformed.items() if keys}
+    if malformed:
+        raise ValueError(
+            f"model_pricing in config/pricing.yaml has entries missing required key(s): {malformed}"
         )
 
 
@@ -130,6 +148,19 @@ def add_cost_to_all_shards():
     """
     pricing_config = _load_pricing_config()
     shard_paths = sorted(glob.glob(os.path.join(PROCESSED_DIR, "shard_*_augmented.parquet")))
+
+    # Upfront validation across ALL shards, before any output is written.
+    # add_execution_cost() already validates per-shard via _require_priced(),
+    # but that's too late for atomicity: a bad/malformed model on shard 8
+    # would only surface after shards 1-7 were already fully processed and
+    # written, leaving a silently incomplete data/processed/ with no signal
+    # the run didn't finish. Only the model column is loaded here (not the
+    # full shard) to keep this fast.
+    coverage_models = pd.concat(
+        [pd.read_parquet(p, columns=["model"])["model"] for p in shard_paths],
+        ignore_index=True,
+    )
+    _require_priced(coverage_models, pricing_config)
 
     cost_slices = []
     output_paths = []

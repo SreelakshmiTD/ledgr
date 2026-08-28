@@ -91,3 +91,38 @@ def test_add_cost_to_all_shards_writes_correct_output(tmp_path, monkeypatch, cal
     assert len(result) == len(df)
     assert not result["execution_cost_usd"].isna().any()
     assert not (result["execution_cost_usd"] < 0).any()
+
+
+def test_upfront_validation_prevents_partial_output(tmp_path, monkeypatch, pricing_config):
+    """Reproduces the exact partial-write scenario found in the prior
+    review: 3 shards, 2 with a valid model and 1 with an unmapped model.
+
+    Before the atomicity fix, add_cost_to_all_shards() wrote
+    shard_0000_final.parquet and shard_0001_final.parquet -- fully valid,
+    normal-looking output -- before crashing on shard 2, leaving a
+    silently incomplete data/processed/ with no signal the run didn't
+    finish. After the fix, the upfront validation pass (across all
+    shards' models, before any shard is processed or any file written)
+    raises immediately and writes ZERO output files."""
+    import pricing
+
+    known_model = next(iter(pricing_config["model_pricing"].keys()))
+
+    for i, model in enumerate([known_model, known_model, "totally-unmapped-model"]):
+        df = pd.DataFrame(
+            {
+                "model": [model] * 10,
+                "input_tokens": [1000] * 10,
+                "output_tokens": [500] * 10,
+                "is_synthetic_retry": [False] * 10,
+            }
+        )
+        df.to_parquet(tmp_path / f"shard_{i:04d}_augmented.parquet", index=False)
+
+    monkeypatch.setattr(pricing, "PROCESSED_DIR", str(tmp_path))
+
+    with pytest.raises(ValueError, match="totally-unmapped-model"):
+        pricing.add_cost_to_all_shards()
+
+    written_final_files = list(tmp_path.glob("*_final.parquet"))
+    assert written_final_files == [], f"expected zero output files, found: {written_final_files}"

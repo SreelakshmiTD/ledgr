@@ -330,6 +330,20 @@ def inject_all_shards():
 
     shard_paths = sorted(glob.glob(os.path.join(PROCESSED_DIR, "shard_*_calls.parquet")))
 
+    # Upfront validation across ALL shards, before any output is written.
+    # inject_synthetic_retries() already validates per-shard via
+    # _require_mapped(), but that's too late for atomicity: a bad
+    # model/harness on shard 8 would only surface after shards 1-7 were
+    # already fully processed and written, leaving a silently incomplete
+    # data/processed/ with no signal the run didn't finish. Only
+    # model/harness columns are loaded here (not the full shard) to keep
+    # this fast.
+    coverage_columns = pd.concat(
+        [pd.read_parquet(p, columns=["model", "harness"]) for p in shard_paths],
+        ignore_index=True,
+    )
+    _require_mapped(coverage_columns, harness_rates, model_rates)
+
     # Lightweight per-shard accumulator for the final aggregate report --
     # only harness/model/is_synthetic_retry, not the full augmented rows, so
     # this stays cheap even across all 9 shards combined.
