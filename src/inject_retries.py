@@ -1,3 +1,5 @@
+import gc
+import glob
 import os
 
 import numpy as np
@@ -51,7 +53,44 @@ def _require_mapped(real, harness_rates, model_rates):
         )
 
 
-def inject_synthetic_retries(df, failure_rates_config, random_seed=42):
+def _compute_injection_probability(harness_series, model_series, harness_rates, model_rates, mean_model_rate):
+    """
+    Row-level injection probability: harness_rate as the anchor (the primary,
+    operationally meaningful signal), scaled by the model's failure rate
+    *relative to the average model* -- a multiplier, not a second absolute
+    rate on a different scale.
+
+    The dataset card only publishes MARGINAL failure rates per harness and
+    per model separately -- it does not publish a joint harness+model rate
+    (e.g. "claude_code running DeepSeek-V3.2"). A first version averaged the
+    two marginals: (harness_rate + model_rate) / 2. That was a confirmed
+    structural bug, not just a labeling issue: harness rates and model rates
+    live on very different scales (claude_code is 0.2928; typical model rates
+    are 0.02-0.07), so a plain average always regresses the achieved rate
+    toward the midpoint of those two scales, for every sample size, no matter
+    how much data you throw at it.
+
+    The multiplier itself also needs a bound. Without one, an outlier model
+    far above the mean (claude-opus-4-5 at 0.2294 vs. a 0.0762 mean -> a
+    ~3.0x multiplier) combined with even a moderate harness rate can push
+    injection_probability to implausible near-certainty for every call that
+    model makes, regardless of harness -- e.g. claude_code (0.2928) x 3.0x
+    -> ~0.88, meaning ~88% of that model's calls would get a synthetic
+    failure, far beyond anything in the documented statistics. Capping only
+    the final probability doesn't fix this: it just clips the symptom while
+    leaving every below-cap combination for that model still inflated. So
+    model_relative_risk is clipped to a bounded range *before* it's used as
+    a multiplier, keeping any single model's influence on the final rate
+    within a realistic range; the final-probability cap stays as a backstop
+    for the harness-rate x bounded-risk combination, not the primary fix.
+    """
+    harness_rate = harness_series.map(harness_rates)
+    model_rate = model_series.map(model_rates)
+    model_relative_risk = (model_rate / mean_model_rate).clip(*RELATIVE_RISK_BOUNDS)
+    return (harness_rate * model_relative_risk).clip(upper=INJECTION_PROBABILITY_CAP)
+
+
+def inject_synthetic_retries(df, failure_rates_config, random_seed=42, verbose=True):
     """
     Takes the flattened call-level DataFrame and injects synthetic failed-retry
     spans, calibrated jointly on harness AND model, not just harness alone.
@@ -60,6 +99,7 @@ def inject_synthetic_retries(df, failure_rates_config, random_seed=42):
 
     harness_rates = failure_rates_config["harness_failure_rates"]
     model_rates = failure_rates_config["model_failure_rates"]
+    mean_model_rate = sum(model_rates.values()) / len(model_rates)
 
     real = df.copy()
     real["is_synthetic_retry"] = False
@@ -67,44 +107,8 @@ def inject_synthetic_retries(df, failure_rates_config, random_seed=42):
 
     _require_mapped(real, harness_rates, model_rates)
 
-    harness_rate = real["harness"].map(harness_rates)
-    model_rate = real["model"].map(model_rates)
-
-    # The dataset card only publishes MARGINAL failure rates per harness and
-    # per model separately -- it does not publish a joint harness+model rate
-    # (e.g. "claude_code running DeepSeek-V3.2").
-    #
-    # A first version averaged the two marginals: (harness_rate + model_rate) / 2.
-    # That was a confirmed structural bug, not just a labeling issue: harness
-    # rates and model rates live on very different scales (claude_code is
-    # 0.2928; typical model rates are 0.02-0.07), so a plain average always
-    # regresses the achieved rate toward the midpoint of those two scales,
-    # for every sample size, no matter how much data you throw at it.
-    #
-    # Fix: use harness_rate as the anchor (the primary, operationally
-    # meaningful signal) and scale it by the model's failure rate *relative
-    # to the average model* -- a multiplier, not a second absolute rate on a
-    # different scale. A model exactly at the average model failure rate
-    # leaves the harness rate unchanged (multiplier = 1); a worse-than-average
-    # model pushes it up, a better-than-average model pulls it down.
-    # The multiplier itself also needs a bound. Without one, an outlier model
-    # far above the mean (claude-opus-4-5 at 0.2294 vs. a 0.0762 mean -> a
-    # ~3.0x multiplier) combined with even a moderate harness rate can push
-    # injection_probability to implausible near-certainty for every call that
-    # model makes, regardless of harness -- e.g. claude_code (0.2928) x 3.0x
-    # -> ~0.88, meaning ~88% of that model's calls would get a synthetic
-    # failure, far beyond anything in the documented statistics. Capping only
-    # the final probability doesn't fix this: it just clips the symptom while
-    # leaving every below-cap combination for that model still inflated. So
-    # model_relative_risk is clipped to a bounded range *before* it's used as
-    # a multiplier, keeping any single model's influence on the final rate
-    # within a realistic range; the final-probability cap stays as a backstop
-    # for the harness-rate x bounded-risk combination, not the primary fix.
-    mean_model_rate = sum(model_rates.values()) / len(model_rates)
-    model_relative_risk = (model_rate / mean_model_rate).clip(*RELATIVE_RISK_BOUNDS)
-
-    injection_probability = (harness_rate * model_relative_risk).clip(
-        upper=INJECTION_PROBABILITY_CAP
+    injection_probability = _compute_injection_probability(
+        real["harness"], real["model"], harness_rates, model_rates, mean_model_rate
     )
 
     draws = rng.random(len(real))
@@ -112,8 +116,13 @@ def inject_synthetic_retries(df, failure_rates_config, random_seed=42):
     selected_idx = real.index[selected_mask]
     n_selected = len(selected_idx)
 
-    start_dt = pd.to_datetime(real["start_time"])
-    end_dt = pd.to_datetime(real["end_time"])
+    # format="ISO8601" (not the default single-format fast path): a handful
+    # of real timestamps land on exactly zero microseconds and are recorded
+    # without a fractional-seconds suffix (e.g. "...T16:09:33+00:00" instead
+    # of "...T16:09:33.000000+00:00"), which pandas' format-inference can't
+    # parse in the same pass as the microsecond-bearing majority.
+    start_dt = pd.to_datetime(real["start_time"], format="ISO8601")
+    end_dt = pd.to_datetime(real["end_time"], format="ISO8601")
 
     # Duration is generated first, and the pre-offset gap is derived from it
     # (duration + a positive buffer) rather than drawn independently. Retries
@@ -156,17 +165,42 @@ def inject_synthetic_retries(df, failure_rates_config, random_seed=42):
     combined = pd.concat([real, synthetic], ignore_index=True)
     combined = combined.sort_values(["task_id", "start_time"]).reset_index(drop=True)
 
-    _print_report(
-        real, selected_mask, injection_probability, harness_rates, model_rates, mean_model_rate
-    )
+    if verbose:
+        _print_report(
+            combined[["harness", "model", "is_synthetic_retry"]],
+            harness_rates,
+            model_rates,
+            mean_model_rate,
+        )
 
     return combined
 
 
-def _print_report(real, selected_mask, injection_probability, harness_rates, model_rates, mean_model_rate):
-    total_real = len(real)
-    total_synthetic = int(selected_mask.sum())
+def _print_report(calls, harness_rates, model_rates, mean_model_rate):
+    """
+    Print total/per-harness/per-model actual-vs-expected injection rates.
+
+    `calls` only needs harness/model/is_synthetic_retry columns -- both real
+    and synthetic rows carry them (synthetic rows copy their real
+    predecessor's), so "actual" is fully recoverable by counting, with no
+    need to also thread a selected_mask array through. This is what makes the
+    same function work for a single shard's combined output AND for the
+    lightweight (harness, model, is_synthetic_retry) slices accumulated
+    across all 9 shards in inject_all_shards -- same computation either way,
+    just a bigger `calls`.
+    """
+    real_mask = ~calls["is_synthetic_retry"]
+    total_real = int(real_mask.sum())
+    total_synthetic = int((~real_mask).sum())
     overall_rate = total_synthetic / total_real if total_real else 0.0
+
+    # A small DataFrame of just the real rows, with each row's own injection
+    # probability attached as a column -- avoids re-aligning a separately
+    # indexed Series against boolean masks below; just filter this and average.
+    real_calls = calls.loc[real_mask, ["harness", "model"]].copy()
+    real_calls["injection_probability"] = _compute_injection_probability(
+        real_calls["harness"], real_calls["model"], harness_rates, model_rates, mean_model_rate
+    )
 
     print(f"Total real rows in: {total_real}")
     print(f"Total synthetic rows injected: {total_synthetic}")
@@ -181,12 +215,13 @@ def _print_report(real, selected_mask, injection_probability, harness_rates, mod
     # only a reference point now, not the target.
     print("\nPer-harness: actual vs. expected injection rate (harness_rate * mix of model_relative_risk)")
     for harness, harness_rate_ref in harness_rates.items():
-        mask = (real["harness"] == harness).to_numpy()
-        n = int(mask.sum())
+        group = real_calls[real_calls["harness"] == harness]
+        n = len(group)
         if n == 0:
             continue
-        actual = float(selected_mask[mask].mean())
-        expected = float(injection_probability.to_numpy()[mask].mean())
+        n_synth = int((~real_mask & (calls["harness"] == harness)).sum())
+        actual = n_synth / n
+        expected = float(group["injection_probability"].mean())
         drift = actual - expected
         flag = " <-- DRIFT > 5pp, likely small-sample variance" if abs(drift) > DRIFT_WARNING_THRESHOLD else ""
         print(
@@ -196,14 +231,15 @@ def _print_report(real, selected_mask, injection_probability, harness_rates, mod
 
     print("\nPer-model: actual vs. expected injection rate (harness_rate * model_relative_risk)")
     for model, model_rate_ref in model_rates.items():
-        mask = (real["model"] == model).to_numpy()
-        n = int(mask.sum())
+        group = real_calls[real_calls["model"] == model]
+        n = len(group)
         if n == 0:
             continue
+        n_synth = int((~real_mask & (calls["model"] == model)).sum())
         raw_relative_risk = model_rate_ref / mean_model_rate
         clipped_relative_risk = min(max(raw_relative_risk, RELATIVE_RISK_BOUNDS[0]), RELATIVE_RISK_BOUNDS[1])
-        actual = float(selected_mask[mask].mean())
-        expected = float(injection_probability.to_numpy()[mask].mean())
+        actual = n_synth / n
+        expected = float(group["injection_probability"].mean())
         drift = actual - expected
         flag = " <-- DRIFT > 5pp, likely small-sample variance" if abs(drift) > DRIFT_WARNING_THRESHOLD else ""
         clip_note = " [CLIPPED]" if clipped_relative_risk != raw_relative_risk else ""
@@ -214,11 +250,76 @@ def _print_report(real, selected_mask, injection_probability, harness_rates, mod
         )
 
 
-if __name__ == "__main__":
+def inject_all_shards():
+    """
+    Apply inject_synthetic_retries() to all 9 data/processed/shard_*_calls.parquet
+    files, one shard at a time (same shard-by-shard memory discipline as
+    process_all_shards() in explode_spans.py -- load, process, write, drop,
+    move on, never hold more than one shard's data in memory at once). Each
+    shard's augmented output (real + synthetic rows combined) is written to
+    data/processed/shard_<N>_augmented.parquet.
+
+    Prints a final summary aggregated across all 9 shards: total real rows,
+    total synthetic rows, overall injection rate, per-harness and per-model
+    actual-vs-expected rates computed over the full dataset (not one shard),
+    and a confirmation that zero timing inversions occurred anywhere.
+    """
     config = _load_config()
-    # shard_0004 is 100% claude_code (harness_rate=0.2928) and includes 2935
-    # claude-opus-4-5 rows -- the exact high-harness-rate x outlier-model
-    # combination the relative_risk clipping is meant to guard against.
-    shard_path = os.path.join(PROCESSED_DIR, "shard_0004_calls.parquet")
-    df = pd.read_parquet(shard_path)
-    result = inject_synthetic_retries(df, config, random_seed=42)
+    harness_rates = config["harness_failure_rates"]
+    model_rates = config["model_failure_rates"]
+    mean_model_rate = sum(model_rates.values()) / len(model_rates)
+
+    shard_paths = sorted(glob.glob(os.path.join(PROCESSED_DIR, "shard_*_calls.parquet")))
+
+    # Lightweight per-shard accumulator for the final aggregate report --
+    # only harness/model/is_synthetic_retry, not the full augmented rows, so
+    # this stays cheap even across all 9 shards combined.
+    report_slices = []
+    total_inversions = 0
+    output_paths = []
+
+    for shard_path in shard_paths:
+        df = pd.read_parquet(shard_path)
+        # Original (pre-injection) start times, keyed by call_id, to check
+        # timing inversions against -- inject_synthetic_retries shifts the
+        # real row's start_time, so this has to be captured before that.
+        original_start = df.set_index("call_id")["start_time"]
+
+        combined = inject_synthetic_retries(df, config, random_seed=42, verbose=False)
+
+        synth = combined[combined["is_synthetic_retry"]]
+        synth_end_dt = pd.to_datetime(synth["end_time"], format="ISO8601")
+        real_orig_start_dt = pd.to_datetime(synth["call_id"].map(original_start), format="ISO8601")
+        total_inversions += int((synth_end_dt >= real_orig_start_dt).sum())
+
+        report_slices.append(combined[["harness", "model", "is_synthetic_retry"]].copy())
+
+        shard_num = os.path.basename(shard_path).replace("_calls.parquet", "")
+        out_path = os.path.join(PROCESSED_DIR, f"{shard_num}_augmented.parquet")
+        combined.to_parquet(out_path, index=False)
+        output_paths.append(out_path)
+
+        print(f"  {os.path.basename(shard_path)}: {len(df)} real -> {len(combined)} total ({len(synth)} synthetic)")
+
+        del df, combined, synth
+        gc.collect()
+
+    all_calls = pd.concat(report_slices, ignore_index=True)
+    del report_slices
+    gc.collect()
+
+    print("\n=== Full-dataset summary (all 9 shards combined) ===\n")
+    _print_report(all_calls, harness_rates, model_rates, mean_model_rate)
+
+    print(f"\nZero timing inversions across full dataset: {total_inversions == 0} (inversions={total_inversions})")
+
+    all_exist = all(os.path.exists(p) for p in output_paths)
+    print(f"\nAll {len(output_paths)} augmented shard files written: {all_exist}")
+    for p in output_paths:
+        print(f"  {p}")
+
+    return output_paths
+
+
+if __name__ == "__main__":
+    inject_all_shards()
