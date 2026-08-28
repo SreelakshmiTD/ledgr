@@ -11,3 +11,35 @@ model_failure_rates:
   claude-opus-4-5: 0.2294
   gemini-3-pro-preview: 0.0235
   gpt-5.2-2025-12-11: 0.0
+
+# Tunable parameters for synthetic retry injection (src/inject_retries.py).
+# Unlike the rates above, these are NOT documented dataset statistics --
+# they're calibration choices made while building the injection logic. Kept
+# here so every tunable lives in one config file instead of split between
+# YAML and hardcoded Python constants. See docs/adr/0001-... for the
+# reasoning behind each.
+injection_calibration:
+  # model_relative_risk (model_rate / mean_model_rate) is clipped to this
+  # range before being used as a multiplier on harness_rate, so no single
+  # model's marginal rate -- however far from the mean -- can swing the
+  # combined probability more than 2x up or 0.5x down from the harness's
+  # own rate. Without this, an outlier like claude-opus-4-5 (~3.0x raw)
+  # paired with a high-failure harness pushed injection probability to
+  # ~88% for that model, far beyond anything documented.
+  relative_risk_bounds: [0.5, 2.0]
+  # Backstop cap on the final harness_rate * relative_risk probability.
+  # A backstop, not the primary defense -- the relative_risk_bounds above
+  # are what keeps most combinations realistic; this just guards the
+  # remaining high-harness-rate x high-relative-risk edge cases.
+  injection_probability_cap: 0.95
+  # In the actual-vs-expected report (not the injection logic itself), a
+  # per-group drift above this is flagged as likely small-sample variance.
+  drift_warning_threshold: 0.05
+  # Synthetic failed retry's own duration, seconds, uniform range.
+  retry_duration_seconds: [1, 5]
+  # Additional buffer added on top of retry duration to build the pre-offset
+  # gap before the real call, seconds, uniform range. gap = duration + buffer
+  # guarantees (by construction) the synthetic attempt's end_time is always
+  # before the real attempt's original start_time, since buffer > 0 --
+  # retries are serialized, so this ordering must always hold.
+  retry_buffer_seconds: [1, 10]

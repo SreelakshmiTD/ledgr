@@ -16,14 +16,29 @@ ERROR_TYPES = ["rate_limit", "timeout", "malformed_response"]
 # dataset's own spans actually use (confirmed by inspection, not assumed).
 SYNTHETIC_STATUS_CODE = 2
 
-DRIFT_WARNING_THRESHOLD = 0.05  # 5 percentage points
-INJECTION_PROBABILITY_CAP = 0.95
-RELATIVE_RISK_BOUNDS = (0.5, 2.0)
-
 
 def _load_config():
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f)
+
+
+def _extract_calibration(failure_rates_config):
+    """
+    Pull the tunable injection-calibration parameters out of
+    config/failure_rates.yaml (injection_calibration:) rather than reading
+    them from hardcoded Python constants. These aren't documented dataset
+    statistics like the failure rates -- they're calibration choices -- but
+    keeping them in the same config file means every tunable lives in one
+    place instead of split between YAML and Python.
+    """
+    calibration = failure_rates_config["injection_calibration"]
+    return {
+        "relative_risk_bounds": tuple(calibration["relative_risk_bounds"]),
+        "injection_probability_cap": calibration["injection_probability_cap"],
+        "drift_warning_threshold": calibration["drift_warning_threshold"],
+        "retry_duration_bounds": tuple(calibration["retry_duration_seconds"]),
+        "retry_buffer_bounds": tuple(calibration["retry_buffer_seconds"]),
+    }
 
 
 def _require_mapped(real, harness_rates, model_rates):
@@ -53,7 +68,7 @@ def _require_mapped(real, harness_rates, model_rates):
         )
 
 
-def _compute_injection_probability(harness_series, model_series, harness_rates, model_rates, mean_model_rate):
+def _compute_injection_probability(harness_series, model_series, harness_rates, model_rates, mean_model_rate, calibration):
     """
     Row-level injection probability: harness_rate as the anchor (the primary,
     operationally meaningful signal), scaled by the model's failure rate
@@ -86,8 +101,8 @@ def _compute_injection_probability(harness_series, model_series, harness_rates, 
     """
     harness_rate = harness_series.map(harness_rates)
     model_rate = model_series.map(model_rates)
-    model_relative_risk = (model_rate / mean_model_rate).clip(*RELATIVE_RISK_BOUNDS)
-    return (harness_rate * model_relative_risk).clip(upper=INJECTION_PROBABILITY_CAP)
+    model_relative_risk = (model_rate / mean_model_rate).clip(*calibration["relative_risk_bounds"])
+    return (harness_rate * model_relative_risk).clip(upper=calibration["injection_probability_cap"])
 
 
 def inject_synthetic_retries(df, failure_rates_config, random_seed=42, verbose=True):
@@ -100,6 +115,7 @@ def inject_synthetic_retries(df, failure_rates_config, random_seed=42, verbose=T
     harness_rates = failure_rates_config["harness_failure_rates"]
     model_rates = failure_rates_config["model_failure_rates"]
     mean_model_rate = sum(model_rates.values()) / len(model_rates)
+    calibration = _extract_calibration(failure_rates_config)
 
     real = df.copy()
     real["is_synthetic_retry"] = False
@@ -108,7 +124,7 @@ def inject_synthetic_retries(df, failure_rates_config, random_seed=42, verbose=T
     _require_mapped(real, harness_rates, model_rates)
 
     injection_probability = _compute_injection_probability(
-        real["harness"], real["model"], harness_rates, model_rates, mean_model_rate
+        real["harness"], real["model"], harness_rates, model_rates, mean_model_rate, calibration
     )
 
     draws = rng.random(len(real))
@@ -133,8 +149,10 @@ def inject_synthetic_retries(df, failure_rates_config, random_seed=42, verbose=T
     # that ordering true by construction: gap = duration + buffer, so
     # synth_end = real_start - gap + duration = real_start - buffer, which is
     # always strictly before real_start since buffer > 0.
-    synth_duration = rng.uniform(1, 5, size=n_selected)
-    buffer = rng.uniform(1, 10, size=n_selected)
+    duration_lo, duration_hi = calibration["retry_duration_bounds"]
+    buffer_lo, buffer_hi = calibration["retry_buffer_bounds"]
+    synth_duration = rng.uniform(duration_lo, duration_hi, size=n_selected)
+    buffer = rng.uniform(buffer_lo, buffer_hi, size=n_selected)
     pre_offset_gap = synth_duration + buffer
 
     sel_start_dt = start_dt.loc[selected_idx]
@@ -171,12 +189,13 @@ def inject_synthetic_retries(df, failure_rates_config, random_seed=42, verbose=T
             harness_rates,
             model_rates,
             mean_model_rate,
+            calibration,
         )
 
     return combined
 
 
-def _print_report(calls, harness_rates, model_rates, mean_model_rate):
+def _print_report(calls, harness_rates, model_rates, mean_model_rate, calibration):
     """
     Print total/per-harness/per-model actual-vs-expected injection rates.
 
@@ -199,7 +218,7 @@ def _print_report(calls, harness_rates, model_rates, mean_model_rate):
     # indexed Series against boolean masks below; just filter this and average.
     real_calls = calls.loc[real_mask, ["harness", "model"]].copy()
     real_calls["injection_probability"] = _compute_injection_probability(
-        real_calls["harness"], real_calls["model"], harness_rates, model_rates, mean_model_rate
+        real_calls["harness"], real_calls["model"], harness_rates, model_rates, mean_model_rate, calibration
     )
 
     print(f"Total real rows in: {total_real}")
@@ -223,7 +242,7 @@ def _print_report(calls, harness_rates, model_rates, mean_model_rate):
         actual = n_synth / n
         expected = float(group["injection_probability"].mean())
         drift = actual - expected
-        flag = " <-- DRIFT > 5pp, likely small-sample variance" if abs(drift) > DRIFT_WARNING_THRESHOLD else ""
+        flag = " <-- DRIFT > 5pp, likely small-sample variance" if abs(drift) > calibration["drift_warning_threshold"] else ""
         print(
             f"  {harness}: n={n} actual={actual:.4f} expected={expected:.4f} "
             f"(raw harness_rate={harness_rate_ref:.4f}) drift={drift:+.4f}{flag}"
@@ -237,11 +256,12 @@ def _print_report(calls, harness_rates, model_rates, mean_model_rate):
             continue
         n_synth = int((~real_mask & (calls["model"] == model)).sum())
         raw_relative_risk = model_rate_ref / mean_model_rate
-        clipped_relative_risk = min(max(raw_relative_risk, RELATIVE_RISK_BOUNDS[0]), RELATIVE_RISK_BOUNDS[1])
+        bounds = calibration["relative_risk_bounds"]
+        clipped_relative_risk = min(max(raw_relative_risk, bounds[0]), bounds[1])
         actual = n_synth / n
         expected = float(group["injection_probability"].mean())
         drift = actual - expected
-        flag = " <-- DRIFT > 5pp, likely small-sample variance" if abs(drift) > DRIFT_WARNING_THRESHOLD else ""
+        flag = " <-- DRIFT > 5pp, likely small-sample variance" if abs(drift) > calibration["drift_warning_threshold"] else ""
         clip_note = " [CLIPPED]" if clipped_relative_risk != raw_relative_risk else ""
         print(
             f"  {model}: n={n} relative_risk={clipped_relative_risk:.4f}{clip_note} "
@@ -268,6 +288,7 @@ def inject_all_shards():
     harness_rates = config["harness_failure_rates"]
     model_rates = config["model_failure_rates"]
     mean_model_rate = sum(model_rates.values()) / len(model_rates)
+    calibration = _extract_calibration(config)
 
     shard_paths = sorted(glob.glob(os.path.join(PROCESSED_DIR, "shard_*_calls.parquet")))
 
@@ -309,7 +330,7 @@ def inject_all_shards():
     gc.collect()
 
     print("\n=== Full-dataset summary (all 9 shards combined) ===\n")
-    _print_report(all_calls, harness_rates, model_rates, mean_model_rate)
+    _print_report(all_calls, harness_rates, model_rates, mean_model_rate, calibration)
 
     print(f"\nZero timing inversions across full dataset: {total_inversions == 0} (inversions={total_inversions})")
 
