@@ -24,6 +24,33 @@ def _load_config():
         return yaml.safe_load(f)
 
 
+def _require_mapped(real, harness_rates, model_rates):
+    """
+    Fail loud on any harness/model not present in the config, instead of
+    silently defaulting via fillna(). A silent default can't distinguish "this
+    model is documented as very safe" from "we have no idea what this model
+    is" -- both used to collapse to the same relative_risk. Better to crash
+    with the specific missing name and force a config update than to
+    misrepresent an unknown model's risk.
+    """
+    unmapped_harness = set(real["harness"].unique()) - set(harness_rates.keys())
+    if unmapped_harness:
+        raise ValueError(
+            f"harness_failure_rates in config/failure_rates.yaml is missing a rate "
+            f"for: {sorted(unmapped_harness)}"
+        )
+
+    if real["model"].isna().any():
+        raise ValueError("Found null 'model' values with no known failure rate.")
+
+    unmapped_model = set(real["model"].unique()) - set(model_rates.keys())
+    if unmapped_model:
+        raise ValueError(
+            f"model_failure_rates in config/failure_rates.yaml is missing a rate "
+            f"for: {sorted(unmapped_model)}"
+        )
+
+
 def inject_synthetic_retries(df, failure_rates_config, random_seed=42):
     """
     Takes the flattened call-level DataFrame and injects synthetic failed-retry
@@ -38,8 +65,10 @@ def inject_synthetic_retries(df, failure_rates_config, random_seed=42):
     real["is_synthetic_retry"] = False
     real["error_type"] = None
 
-    harness_rate = real["harness"].map(harness_rates).fillna(0.0)
-    model_rate = real["model"].map(model_rates).fillna(0.0)
+    _require_mapped(real, harness_rates, model_rates)
+
+    harness_rate = real["harness"].map(harness_rates)
+    model_rate = real["model"].map(model_rates)
 
     # The dataset card only publishes MARGINAL failure rates per harness and
     # per model separately -- it does not publish a joint harness+model rate
@@ -86,11 +115,21 @@ def inject_synthetic_retries(df, failure_rates_config, random_seed=42):
     start_dt = pd.to_datetime(real["start_time"])
     end_dt = pd.to_datetime(real["end_time"])
 
-    pre_offset = rng.uniform(2, 15, size=n_selected)
+    # Duration is generated first, and the pre-offset gap is derived from it
+    # (duration + a positive buffer) rather than drawn independently. Retries
+    # are serialized -- attempt 0 must fully finish before attempt 1 starts --
+    # so an independently-drawn gap could be shorter than the duration it's
+    # supposed to contain, letting the synthetic attempt's end_time land
+    # after the real attempt's start_time. Deriving the gap this way makes
+    # that ordering true by construction: gap = duration + buffer, so
+    # synth_end = real_start - gap + duration = real_start - buffer, which is
+    # always strictly before real_start since buffer > 0.
     synth_duration = rng.uniform(1, 5, size=n_selected)
+    buffer = rng.uniform(1, 10, size=n_selected)
+    pre_offset_gap = synth_duration + buffer
 
     sel_start_dt = start_dt.loc[selected_idx]
-    synth_start_dt = sel_start_dt - pd.to_timedelta(pre_offset, unit="s")
+    synth_start_dt = sel_start_dt - pd.to_timedelta(pre_offset_gap, unit="s")
     synth_end_dt = synth_start_dt + pd.to_timedelta(synth_duration, unit="s")
 
     synthetic = real.loc[selected_idx].copy()
