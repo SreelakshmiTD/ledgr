@@ -1,0 +1,13 @@
+harness_failure_rates:
+  claude_code: 0.2928
+  openai_solo: 0.026
+  smolagents_code: 0.0005
+  tool_calling: 0.0023
+  tool_calling_with_shortlisting: 0.0006
+
+model_failure_rates:
+  DeepSeek-V3.2: 0.0574
+  Kimi-K2.5: 0.0707
+  claude-opus-4-5: 0.2294
+  gemini-3-pro-preview: 0.0235
+  gpt-5.2-2025-12-11: 0.0

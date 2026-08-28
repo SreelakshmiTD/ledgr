@@ -1,0 +1,123 @@
+# 1. Calibrating synthetic retry injection to harness and model failure rates
+
+## Status
+
+Accepted (revised)
+
+## Context
+
+`src/inject_retries.py` injects synthetic failed-retry spans into the flattened
+call-level data, so downstream analysis reflects realistic retry overhead. The
+Exgentic dataset card publishes two separate marginal failure rates in
+`config/failure_rates.yaml`:
+
+- `harness_failure_rates` (e.g. `claude_code: 0.2928`)
+- `model_failure_rates` (e.g. `DeepSeek-V3.2: 0.0574`, `claude-opus-4-5: 0.2294`)
+
+There is no published *joint* harness+model failure rate (e.g. "claude_code
+running DeepSeek-V3.2specifically"). Each real call has both a harness and a
+model, so injection has to be calibrated on both dimensions from these two
+marginals alone.
+
+## Decision (first attempt, rejected)
+
+The first version combined the two marginals by averaging:
+
+```
+injection_probability = (harness_rate + model_rate) / 2
+```
+
+This was disclosed at the time as "a defensible approximation of a missing
+joint statistic." Testing on `shard_0000_calls.parquet` (100% `claude_code`,
+harness rate 0.2928) showed the achieved injection rate landing around 0.18,
+not 0.29 — and per-model actual rates for both `DeepSeek-V3.2` and
+`Kimi-K2.5` also missed their marginal targets by 12+ percentage points.
+
+Claude Code's analysis confirmed this was **not** small-sample noise: harness
+rates and model rates sit on very different scales (claude_code is 0.2928;
+typical model rates are 0.02-0.07). Averaging two numbers on different scales
+always regresses the result toward their midpoint, for any sample size —
+more data would not have closed the gap. The averaging approach was a
+structural bug, not a labeling problem.
+
+## Decision (revised)
+
+Replaced averaging with a harness-rate-anchored, model-relative-risk
+multiplier:
+
+```
+mean_model_rate = mean(model_failure_rates.values())
+model_relative_risk = model_failure_rates[row.model] / mean_model_rate
+injection_probability = harness_failure_rates[row.harness] * model_relative_risk
+injection_probability = min(injection_probability, 0.95)  # sanity cap
+```
+
+`harness_rate` is the anchor — the primary, operationally meaningful signal
+(how often does this harness fail, in absolute terms). `model_relative_risk`
+is a multiplier, not a second absolute rate: a model exactly at the average
+model failure rate leaves the harness rate unchanged (multiplier = 1); a
+worse-than-average model pushes it up; a better-than-average model pulls it
+down. The result stays anchored to the harness's real scale instead of being
+pulled toward the midpoint of two incompatible scales. The 0.95 cap guards
+against a high-harness-rate x high-relative-risk combination pushing the
+probability unrealistically close to certainty.
+
+Re-tested on `shard_0000_calls.parquet`: actual injection rates now land
+within ~1 percentage point of the corrected expected value (harness_rate ×
+that group's actual mix of model_relative_risk) for both the harness as a
+whole and each model individually — well inside the 5pp small-sample-variance
+threshold, versus 11-12pp drift under the averaging approach.
+
+## Decision (second revision): bound the multiplier, not just the result
+
+The anchor+multiplier fix above still had a real gap. `claude-opus-4-5`'s
+rate (0.2294) is ~3.0x `mean_model_rate` (0.0762). Paired with `claude_code`
+(0.2928), the unbounded multiplier gives `0.2928 * 3.0105 ≈ 0.88` — meaning
+~88% of that model's calls under that harness would get a synthetic failure
+injected, far beyond anything in the documented statistics, and close enough
+to the 0.95 cap that it wasn't a safe margin. Capping only the final
+probability doesn't fix this: it clips the symptom (the rare cases that
+actually hit 0.95) while leaving every below-cap case for that model, like
+this one, still inflated by the raw ~3.0x multiplier.
+
+Fix: clip `model_relative_risk` itself to `[0.5, 2.0]` *before* using it as
+a multiplier, in addition to keeping the final-probability cap at 0.95 as a
+backstop:
+
+```
+mean_model_rate = mean(model_failure_rates.values())
+model_relative_risk = clip(model_failure_rates[row.model] / mean_model_rate, 0.5, 2.0)
+injection_probability = harness_failure_rates[row.harness] * model_relative_risk
+injection_probability = min(injection_probability, 0.95)  # backstop, not primary fix
+```
+
+Re-tested on `shard_0004_calls.parquet` (100% `claude_code`, 2935
+`claude-opus-4-5` rows — the exact high-harness-rate x outlier-model
+combination this targets):
+
+- `claude-opus-4-5`: raw relative risk 3.0105 -> clipped to 2.0000.
+  Achieved injection rate **59.69%**, matching the corrected expected value
+  of 58.56% (`0.2928 * 2.0`), versus the ~88% the unclipped multiplier would
+  have produced. Not close to the 0.95 cap.
+- The lower bound also engaged for low-risk models in the same shard:
+  `gemini-3-pro-preview` (raw relative risk 0.3084) and `gpt-5.2-2025-12-11`
+  (raw relative risk 0.0, since its documented rate is 0.0) both clipped up
+  to 0.5, so neither is treated as functionally failure-proof under a
+  high-failure harness.
+
+## Consequences
+
+- Injection probability is still an approximation (the true joint rate isn't
+  published), but it no longer has a built-in bias that persists regardless
+  of sample size, and no single model's marginal rate — however far from
+  `mean_model_rate` — can swing the combined probability more than 2x up or
+  0.5x down from the harness's own rate.
+- The reporting in `inject_synthetic_retries` compares actual achieved rates
+  against the *expected value implied by the row-level formula* (mean of
+  each row's own `harness_rate * clipped model_relative_risk` within a
+  group), not against the raw marginal alone — the raw marginal and the
+  unclipped relative risk are both printed for reference, since a harness's
+  true expected rate depends on the mix of models it pairs with in the data.
+- The `[0.5, 2.0]` bound is a chosen sanity range, not a documented dataset
+  statistic — same disclosure principle as the anchor+multiplier design
+  itself: an explicit, defensible approximation, not a fabricated precision.
