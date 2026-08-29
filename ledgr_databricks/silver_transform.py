@@ -127,7 +127,45 @@ def generate_synthetic_retries(df, seed=SEED):
         .withColumn("synth_start_time", F.col("real_start_ts") - F.expr("INTERVAL 1 SECONDS") * F.col("pre_offset_sec"))
         .withColumn("synth_end_time", F.col("synth_start_time") + F.expr("INTERVAL 1 SECONDS") * F.col("retry_duration_sec"))
     )
+def add_outcome_state(df):
+    """
+    Derive an outcome_state column from status_code and is_synthetic_retry.
+    - Synthetic (failed) attempts are always FAILED
+    - Real attempts with status_code == 1 (OTel success convention) are SUCCESS
+    - Real attempts with any other status_code are FAILED
+    - EVALUATION_ERROR is reserved for a future evaluation layer, not derivable
+      from current data, so it never appears here, documented as a known gap
+    """
+    return df.withColumn(
+        "outcome_state",
+        F.when(F.col("is_synthetic_retry") == True, F.lit("FAILED"))
+         .when(F.col("status_code") == 1, F.lit("SUCCESS"))
+         .otherwise(F.lit("FAILED"))
+    )
+    
+def validate_synthetic_retries(synthetic_df, real_df):
+    """
+    Fail-loud check: synthetic retry rows must have no null timestamps and 
+    must never have an end_time at or after the corresponding real row's 
+    original start_time (the core timing-inversion guarantee).
+    """
+    null_timestamps = synthetic_df.filter(
+        F.col("start_time").isNull() | F.col("end_time").isNull()
+    ).count()
+    if null_timestamps > 0:
+        raise ValueError("Found " + str(null_timestamps) + " synthetic rows with null timestamps")
 
+    check_df = synthetic_df.join(
+        real_df.select("call_id", F.col("start_time").alias("real_start_time")),
+        on="call_id"
+    )
+    inversions = check_df.filter(
+        F.to_timestamp(F.col("end_time")) >= F.to_timestamp(F.col("real_start_time"))
+    ).count()
+    if inversions > 0:
+        raise ValueError("Found " + str(inversions) + " timing inversions in synthetic rows")
+
+    return True
     result = synthetic_df.select(
         F.col("task_id"), F.col("run_id"), F.col("trace_id"),
         F.col("call_id"),
