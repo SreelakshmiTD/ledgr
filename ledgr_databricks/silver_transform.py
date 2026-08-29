@@ -17,6 +17,14 @@ MODEL_RATES = {
 MEAN_MODEL_RATE = sum(MODEL_RATES.values()) / len(MODEL_RATES)
 SEED = 42
 
+PRICING = {
+    "DeepSeek-V3.2": {"input_per_million": 0.580, "output_per_million": 1.68},
+    "Kimi-K2.5": {"input_per_million": 0.60, "output_per_million": 3.00},
+    "claude-opus-4-5": {"input_per_million": 5.00, "output_per_million": 25.00},
+    "gemini-3-pro-preview": {"input_per_million": 2.00, "output_per_million": 12.00},
+    "gpt-5.2-2025-12-11": {"input_per_million": 1.75, "output_per_million": 14.00},
+}
+
 
 def explode_bronze_sessions(bronze_df):
     """Explode session-level Bronze data into call-level rows."""
@@ -82,3 +90,155 @@ def compute_injection_probability(df, harness_rates=HARNESS_RATES, model_rates=M
         .withColumn("hash_uniform", (F.pmod(F.xxhash64(F.col("call_id"), F.lit(seed)), F.lit(1000000)) / F.lit(1000000.0)))
         .withColumn("is_selected_for_injection", F.col("hash_uniform") < F.col("injection_probability"))
     )
+
+
+def validate_pricing_coverage(df, pricing=PRICING):
+    """Fail-loud check: every model in the data must have pricing configured."""
+    actual_models = set(row.model_request for row in df.select("model_request").distinct().collect())
+    unmapped = actual_models - set(pricing.keys())
+    if unmapped:
+        raise ValueError(f"pricing config is missing rates for: {unmapped}")
+    return True
+
+
+def compute_execution_cost(df, pricing=PRICING):
+    """Calculate execution_cost_usd per row based on model and token counts."""
+    input_price_map = F.create_map([
+        F.lit(x) for model, rates in pricing.items() for x in (model, rates["input_per_million"])
+    ])
+    output_price_map = F.create_map([
+        F.lit(x) for model, rates in pricing.items() for x in (model, rates["output_per_million"])
+    ])
+    return df.withColumn(
+        "execution_cost_usd",
+        (F.col("input_tokens") / F.lit(1_000_000) * input_price_map[F.col("model_request")]) +
+        (F.col("output_tokens") / F.lit(1_000_000) * output_price_map[F.col("model_request")])
+    )
+
+
+def generate_synthetic_retries(df, seed=SEED):
+    """
+    For rows selected for injection, generate a synthetic failed-attempt row
+    preceding the real one. Duration is generated first, then the pre-offset
+    gap is derived from it, guaranteeing the synthetic attempt always finishes
+    before the real one starts (structurally impossible to invert).
+    """
+    selected_df = df.filter(F.col("is_selected_for_injection") == True)
+
+    synthetic_df = (selected_df
+        .withColumn("synth_duration_seed", F.pmod(F.xxhash64(F.col("call_id"), F.lit(seed + 1)), F.lit(4000)))
+        .withColumn("retry_duration_sec", (F.col("synth_duration_seed") / F.lit(1000.0)) + F.lit(1.0))
+        .withColumn("synth_buffer_seed", F.pmod(F.xxhash64(F.col("call_id"), F.lit(seed + 2)), F.lit(9000)))
+        .withColumn("buffer_sec", (F.col("synth_buffer_seed") / F.lit(1000.0)) + F.lit(1.0))
+        .withColumn("pre_offset_sec", F.col("retry_duration_sec") + F.col("buffer_sec"))
+        .withColumn("real_start_ts", F.to_timestamp(F.col("start_time"), "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX"))
+        .withColumn("synth_start_time", F.col("real_start_ts") - F.expr("INTERVAL 1 SECONDS") * F.col("pre_offset_sec"))
+        .withColumn("synth_end_time", F.col("synth_start_time") + F.expr("INTERVAL 1 SECONDS") * F.col("retry_duration_sec"))
+    )
+
+    result = synthetic_df.select(
+        F.col("task_id"), F.col("run_id"), F.col("trace_id"),
+        F.col("call_id"),
+        F.concat(F.col("call_id"), F.lit("_attempt_0")).alias("attempt_id"),
+        F.col("synth_start_time").cast("string").alias("start_time"),
+        F.col("synth_end_time").cast("string").alias("end_time"),
+        F.lit(2).alias("status_code"),
+        F.lit("synthetic_failure").alias("status_message"),
+        F.col("model_request"), F.col("model_response"),
+        F.col("input_tokens"),
+        F.lit(0).alias("output_tokens"),
+        F.col("provider"),
+        F.col("input_message_length"),
+        F.lit(0).alias("output_message_length"),
+        F.col("has_tool_definitions"),
+        F.col("harness"), F.col("benchmark"), F.col("success"),
+        F.col("execution_cost_usd"),
+        F.lit(True).alias("is_synthetic_retry"),
+    )
+    return result
+
+
+def validate_synthetic_retries(synthetic_df, real_df):
+    """
+    Fail-loud check: synthetic retry rows must have no null timestamps and
+    must never have an end_time at or after the corresponding real row's
+    original start_time (the core timing-inversion guarantee).
+    """
+    null_timestamps = synthetic_df.filter(
+        F.col("start_time").isNull() | F.col("end_time").isNull()
+    ).count()
+    if null_timestamps > 0:
+        raise ValueError("Found " + str(null_timestamps) + " synthetic rows with null timestamps")
+
+    check_df = synthetic_df.join(
+        real_df.select("call_id", F.col("start_time").alias("real_start_time")),
+        on="call_id"
+    )
+    inversions = check_df.filter(
+        F.to_timestamp(F.col("end_time")) >= F.to_timestamp(F.col("real_start_time"))
+    ).count()
+    if inversions > 0:
+        raise ValueError("Found " + str(inversions) + " timing inversions in synthetic rows")
+
+    return True
+
+
+def add_outcome_state(df):
+    """
+    Derive an outcome_state column from status_code and is_synthetic_retry.
+    - Synthetic (failed) attempts are always FAILED
+    - Real attempts with status_code == 1 (OTel success convention) are SUCCESS
+    - Real attempts with any other status_code are FAILED
+    - EVALUATION_ERROR is reserved for a future evaluation layer, not derivable
+      from current data, so it never appears here, documented as a known gap
+    """
+    return df.withColumn(
+        "outcome_state",
+        F.when(F.col("is_synthetic_retry") == True, F.lit("FAILED"))
+         .when(F.col("status_code") == 1, F.lit("SUCCESS"))
+         .otherwise(F.lit("FAILED"))
+    )
+
+
+def materialize_silver(spark, bronze_table="ledgr.bronze.sessions_raw",
+                        silver_table="ledgr.silver.calls_enriched"):
+    """
+    Full Silver materialization pipeline: explode, normalize, validate config,
+    compute injection probability, price, generate synthetic retries, validate
+    synthetic rows (fail-loud, blocks write on failure), add outcome state,
+    and write to Delta.
+    """
+    bronze_df = spark.table(bronze_table)
+    exploded_df = explode_bronze_sessions(bronze_df)
+    normalized_df = extract_call_fields(exploded_df)
+
+    validate_config_coverage(normalized_df)
+    validate_pricing_coverage(normalized_df)
+
+    injected_df = compute_injection_probability(normalized_df)
+    priced_df = compute_execution_cost(injected_df)
+
+    synthetic_df = generate_synthetic_retries(priced_df)
+    synthetic_priced_df = compute_execution_cost(synthetic_df.drop("execution_cost_usd"))
+
+    real_final_df = priced_df.select(
+        "task_id", "run_id", "trace_id", "call_id", "attempt_id",
+        "start_time", "end_time", "status_code", "status_message",
+        "model_request", "model_response", "input_tokens", "output_tokens",
+        "provider", "input_message_length", "output_message_length",
+        "has_tool_definitions", "harness", "benchmark", "success",
+        "execution_cost_usd"
+    ).withColumn("is_synthetic_retry", F.lit(False))
+
+    validate_synthetic_retries(synthetic_priced_df, real_final_df)
+
+    combined_df = real_final_df.unionByName(synthetic_priced_df)
+    combined_with_state = add_outcome_state(combined_df)
+
+    (combined_with_state.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(silver_table))
+
+    return spark.table(silver_table).count()
