@@ -1,0 +1,25 @@
+version: 2
+
+models:
+  - name: mart_cost_per_success
+    description: "Cost-per-successful-outcome by model and harness, both including-waste and success-only variants"
+    columns:
+      - name: model_request
+        tests:
+          - not_null
+      - name: harness
+        tests:
+          - not_null
+      - name: total_cost_usd
+        tests:
+          - not_null
+      - name: successful_calls
+        tests:
+          - not_null
+    tests:
+      - dbt_utils.expression_is_true:
+          expression: "successful_calls <= total_calls"
+      - dbt_utils.expression_is_true:
+          expression: "total_cost_usd >= successful_cost_usd"
+      - dbt_utils.expression_is_true:
+          expression: "wasted_retry_cost_usd >= 0"

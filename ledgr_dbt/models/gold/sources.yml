@@ -1,0 +1,8 @@
+version: 2
+
+sources:
+  - name: silver
+    database: ledgr
+    schema: silver
+    tables:
+      - name: calls_enriched
