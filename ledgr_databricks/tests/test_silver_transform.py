@@ -1,6 +1,6 @@
 import pytest
 from pyspark.sql import SparkSession, Row
-from databricks.silver_transform import (
+from ledgr_databricks.silver_transform import (
     validate_config_coverage,
     compute_injection_probability,
     HARNESS_RATES,
@@ -10,7 +10,7 @@ from databricks.silver_transform import (
 
 @pytest.fixture(scope="module")
 def spark():
-    return SparkSession.builder.appName("ledgr-tests").getOrCreate()
+    return SparkSession.builder.getOrCreate()
 
 
 def test_validate_config_coverage_passes_for_known_values(spark):
