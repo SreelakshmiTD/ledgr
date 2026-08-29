@@ -82,3 +82,69 @@ def compute_injection_probability(df, harness_rates=HARNESS_RATES, model_rates=M
         .withColumn("hash_uniform", (F.pmod(F.xxhash64(F.col("call_id"), F.lit(seed)), F.lit(1000000)) / F.lit(1000000.0)))
         .withColumn("is_selected_for_injection", F.col("hash_uniform") < F.col("injection_probability"))
     )
+
+PRICING = {
+    "DeepSeek-V3.2": {"input_per_million": 0.580, "output_per_million": 1.68},
+    "Kimi-K2.5": {"input_per_million": 0.60, "output_per_million": 3.00},
+    "claude-opus-4-5": {"input_per_million": 5.00, "output_per_million": 25.00},
+    "gemini-3-pro-preview": {"input_per_million": 2.00, "output_per_million": 12.00},
+    "gpt-5.2-2025-12-11": {"input_per_million": 1.75, "output_per_million": 14.00},
+}
+
+
+def validate_pricing_coverage(df, pricing=PRICING):
+    """Fail-loud check: every model in the data must have pricing configured."""
+    actual_models = set(row.model_request for row in df.select("model_request").distinct().collect())
+    unmapped = actual_models - set(pricing.keys())
+    if unmapped:
+        raise ValueError(f"pricing config is missing rates for: {unmapped}")
+    return True
+
+
+def compute_execution_cost(df, pricing=PRICING):
+    """Calculate execution_cost_usd per row based on model and token counts."""
+    input_price_map = F.create_map([
+        F.lit(x) for model, rates in pricing.items() for x in (model, rates["input_per_million"])
+    ])
+    output_price_map = F.create_map([
+        F.lit(x) for model, rates in pricing.items() for x in (model, rates["output_per_million"])
+    ])
+    return df.withColumn(
+        "execution_cost_usd",
+        (F.col("input_tokens") / F.lit(1_000_000) * input_price_map[F.col("model_request")]) +
+        (F.col("output_tokens") / F.lit(1_000_000) * output_price_map[F.col("model_request")])
+    )
+def generate_synthetic_retries(df, seed=SEED):
+    selected_df = df.filter(F.col("is_selected_for_injection") == True)
+
+    synthetic_df = (selected_df
+        .withColumn("synth_duration_seed", F.pmod(F.xxhash64(F.col("call_id"), F.lit(seed + 1)), F.lit(4000)))
+        .withColumn("retry_duration_sec", (F.col("synth_duration_seed") / F.lit(1000.0)) + F.lit(1.0))
+        .withColumn("synth_buffer_seed", F.pmod(F.xxhash64(F.col("call_id"), F.lit(seed + 2)), F.lit(9000)))
+        .withColumn("buffer_sec", (F.col("synth_buffer_seed") / F.lit(1000.0)) + F.lit(1.0))
+        .withColumn("pre_offset_sec", F.col("retry_duration_sec") + F.col("buffer_sec"))
+        .withColumn("real_start_ts", F.to_timestamp(F.col("start_time"), "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX"))
+        .withColumn("synth_start_time", F.col("real_start_ts") - F.expr("INTERVAL 1 SECONDS") * F.col("pre_offset_sec"))
+        .withColumn("synth_end_time", F.col("synth_start_time") + F.expr("INTERVAL 1 SECONDS") * F.col("retry_duration_sec"))
+    )
+
+    result = synthetic_df.select(
+        F.col("task_id"), F.col("run_id"), F.col("trace_id"),
+        F.col("call_id"),
+        F.concat(F.col("call_id"), F.lit("_attempt_0")).alias("attempt_id"),
+        F.col("synth_start_time").cast("string").alias("start_time"),
+        F.col("synth_end_time").cast("string").alias("end_time"),
+        F.lit(2).alias("status_code"),
+        F.lit("synthetic_failure").alias("status_message"),
+        F.col("model_request"), F.col("model_response"),
+        F.col("input_tokens"),
+        F.lit(0).alias("output_tokens"),
+        F.col("provider"),
+        F.col("input_message_length"),
+        F.lit(0).alias("output_message_length"),
+        F.col("has_tool_definitions"),
+        F.col("harness"), F.col("benchmark"), F.col("success"),
+        F.col("execution_cost_usd"),
+        F.lit(True).alias("is_synthetic_retry"),
+    )
+    return result
