@@ -32,7 +32,12 @@ with_rolling_baseline AS (
             PARTITION BY model_request
             ORDER BY call_date
             ROWS BETWEEN 6 PRECEDING AND 1 PRECEDING
-        ) AS rolling_7day_stddev
+        ) AS rolling_7day_stddev,
+        COUNT(*) OVER (
+            PARTITION BY model_request
+            ORDER BY call_date
+            ROWS BETWEEN 6 PRECEDING AND 1 PRECEDING
+        ) AS days_in_window
     FROM daily_cost_per_success
 )
 
@@ -44,12 +49,15 @@ SELECT
     cost_per_success,
     rolling_7day_mean,
     rolling_7day_stddev,
+    days_in_window,
     CASE 
+        WHEN days_in_window < 3 THEN FALSE  -- too few prior days for a reliable baseline
         WHEN rolling_7day_mean IS NULL OR rolling_7day_stddev IS NULL OR rolling_7day_stddev = 0 
             THEN FALSE
         WHEN ABS(cost_per_success - rolling_7day_mean) > (2 * rolling_7day_stddev) 
             THEN TRUE
         ELSE FALSE
-    END AS is_anomaly
+    END AS is_anomaly,
+    CASE WHEN days_in_window < 3 THEN TRUE ELSE FALSE END AS baseline_unreliable
 FROM with_rolling_baseline
 ORDER BY model_request, call_date

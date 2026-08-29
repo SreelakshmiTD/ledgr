@@ -4,10 +4,10 @@ models:
   - name: mart_cost_anomalies
     description: >
       Daily cost-per-successful-outcome by model, with a 7-day rolling 
-      baseline (mean +/- 2 stddev) used to flag anomalies. This is a 
-      baseline statistical demonstration, not production-grade anomaly 
-      detection, the dataset spans only 21 distinct days, insufficient 
-      for robust seasonality or trend modeling at production scale.
+      baseline (mean +/- 2 stddev) used to flag anomalies. Baseline 
+      statistical demonstration, not production-grade, dataset spans 
+      only 21 distinct days. Rows with fewer than 3 prior days in the 
+      window are flagged baseline_unreliable and never marked as anomalies.
     columns:
       - name: model_request
         tests:
@@ -18,3 +18,7 @@ models:
     tests:
       - dbt_utils.expression_is_true:
           expression: "daily_successful_calls >= 0"
+      - dbt_utils.expression_is_true:
+          expression: "NOT (baseline_unreliable = true AND is_anomaly = true)"
+      - dbt_utils.expression_is_true:
+          expression: "NOT (rolling_7day_stddev IS NULL AND is_anomaly = true)"
