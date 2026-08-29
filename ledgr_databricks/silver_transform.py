@@ -207,6 +207,16 @@ def materialize_silver(spark, bronze_table="ledgr.bronze.sessions_raw",
     compute injection probability, price, generate synthetic retries, validate
     synthetic rows (fail-loud, blocks write on failure), add outcome state,
     and write to Delta.
+
+    No manual .cache()/.persist() here despite normalized_df being read
+    multiple times below (by both validate_ calls, then again by the
+    injection/pricing/synthetic-retry chain): this runs on Serverless
+    compute, which manages its own internal caching automatically and does
+    not expose manual cache control to the user. A .cache() call here
+    would not work (Serverless silently ignores or errors on it depending
+    on version) -- this is a genuine platform constraint to design around,
+    not a missing optimization. On classic (non-Serverless) clusters where
+    .cache()/.persist() ARE available, this would be worth revisiting.
     """
     bronze_df = spark.table(bronze_table)
     exploded_df = explode_bronze_sessions(bronze_df)
