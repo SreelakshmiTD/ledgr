@@ -38,3 +38,16 @@ ambiguity. A lightweight tracking mart (mart_success_outcome_reconciliation)
 was added to keep this reconciliation rate visible going forward, so a
 dramatic future shift in the rate (which could indicate an actual pipeline
 issue) would be noticeable rather than silent.
+
+## Correction
+
+A subsequent review of the underlying SQL found the original 63.07%
+figure incorrectly included synthetic retry rows (always outcome_
+state=FAILED by construction, representing this project's own injected
+failed attempts, not real API behavior) in the comparison. After
+excluding synthetic rows, the true mismatch rate is 53.27% (5,357 of
+10,056 sessions). The core interpretation is unchanged (success and
+outcome_state are genuinely different signals), but the original
+number was a measurement artifact, not accurate evidence. Fixed in
+mart_success_outcome_reconciliation.sql by adding a WHERE is_synthetic_
+retry = false filter before aggregation.
