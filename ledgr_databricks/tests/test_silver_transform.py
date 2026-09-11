@@ -274,3 +274,73 @@ def test_add_outcome_state_synthetic_always_failed(spark):
     assert states[(True, 1)] == "FAILED"
     assert states[(False, 1)] == "SUCCESS"
     assert states[(False, 2)] == "FAILED"
+
+def test_injection_calibration_audit_matches_silver_row_count(spark):
+    audit_count = spark.table("ledgr.silver.injection_calibration_audit").count()
+    real_silver_count = spark.table("ledgr.silver.calls_enriched").filter(
+        F.col("is_synthetic_retry") == False
+    ).count()
+    assert audit_count == real_silver_count
+
+def test_injection_calibration_audit_matches_silver_row_count(spark):
+    audit_count = spark.table("ledgr.silver.injection_calibration_audit").count()
+    real_silver_count = spark.table("ledgr.silver.calls_enriched").filter(
+        F.col("is_synthetic_retry") == False
+    ).count()
+    assert audit_count == real_silver_count
+      
+def test_generate_synthetic_retries_handles_zero_microsecond_timestamp(spark):
+    """
+    Regression test: real production data can have timestamps with zero 
+    microseconds, recorded WITHOUT a fractional-seconds suffix 
+    (e.g. '...T16:09:33+00:00' instead of '...T16:09:33.000000+00:00').
+    A rigid fixed-format parser fails silently (returns NULL) on these.
+    """
+    bronze_schema = spark.table("ledgr.bronze.sessions_raw").schema
+
+    span_attrs = Row(**{
+        "error.type": None, "gen_ai.conversation.id": None,
+        "gen_ai.input.messages": "hi", "gen_ai.operation.name": "chat",
+        "gen_ai.output.messages": "hello", "gen_ai.output.type": None,
+        "gen_ai.provider.name": "anthropic",
+        "gen_ai.request.max_tokens": 100, "gen_ai.request.model": "claude-opus-4-5",
+        "gen_ai.request.stop_sequences": [], "gen_ai.request.temperature": 0.5,
+        "gen_ai.response.finish_reasons": ["stop"], "gen_ai.response.id": "span1",
+        "gen_ai.response.model": "claude-opus-4-5", "gen_ai.system_instructions": None,
+        "gen_ai.tool.definitions": None,
+        "gen_ai.usage.input_tokens": 100, "gen_ai.usage.output_tokens": 50,
+    })
+    res_attrs = Row(**{
+        "deployment.environment.name": None, "service.name": None,
+        "service.namespace": None, "service.version": None,
+        "telemetry.sdk.language": None, "telemetry.sdk.name": None,
+        "telemetry.sdk.version": None,
+    })
+    # Deliberately NO fractional-seconds suffix, the exact edge case that broke before
+    spans_list = [
+        Row(span_id="span1", trace_id="t1", parent_span_id=None, name="chat", kind="internal",
+            start_time="2026-01-01T00:00:10+00:00", end_time="2026-01-01T00:00:11+00:00",
+            status=Row(code=1, message=None), attributes=span_attrs,
+            resource_attributes=res_attrs, events=None),
+    ]
+    bronze_df = spark.createDataFrame([
+        Row(schema_version="1.0", config_path=None, run_id="r1", session_id="s1",
+            harness="claude_code", benchmark="test", benchmark_subset=None,
+            models=["test"], score=0.0, success=True, status="ok", steps=1,
+            action_count=1, agent_cost=1.0, benchmark_cost=0.0, execution_time=10.0,
+            total_tokens=150, max_tokens=100, spans=spans_list, collected_at="2026-01-01")
+    ], schema=bronze_schema)
+
+    exploded = explode_bronze_sessions(bronze_df)
+    normalized = extract_call_fields(exploded)
+    injected = compute_injection_probability(normalized)
+    priced = compute_execution_cost(injected)
+    forced_df = priced.withColumn("is_selected_for_injection", F.lit(True))
+
+    synthetic = generate_synthetic_retries(forced_df)
+    result = synthetic.collect()[0]
+
+    # This is the actual regression check: if the timestamp parse failed 
+    # (as it did before this fix), start_time/end_time would be null/None
+    assert result.start_time is not None
+    assert result.end_time is not None

@@ -131,7 +131,7 @@ def generate_synthetic_retries(df, seed=SEED):
         .withColumn("synth_buffer_seed", F.pmod(F.xxhash64(F.col("call_id"), F.lit(seed + 2)), F.lit(9000)))
         .withColumn("buffer_sec", (F.col("synth_buffer_seed") / F.lit(1000.0)) + F.lit(1.0))
         .withColumn("pre_offset_sec", F.col("retry_duration_sec") + F.col("buffer_sec"))
-        .withColumn("real_start_ts", F.to_timestamp(F.col("start_time"), "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX"))
+        .withColumn("real_start_ts", F.to_timestamp(F.col("start_time")))
         .withColumn("synth_start_time", F.col("real_start_ts") - F.expr("INTERVAL 1 SECONDS") * F.col("pre_offset_sec"))
         .withColumn("synth_end_time", F.col("synth_start_time") + F.expr("INTERVAL 1 SECONDS") * F.col("retry_duration_sec"))
     )
@@ -226,7 +226,26 @@ def materialize_silver(spark, bronze_table="ledgr.bronze.sessions_raw",
     validate_pricing_coverage(normalized_df)
 
     injected_df = compute_injection_probability(normalized_df)
+
+    # Persist the calibration audit trail alongside the main pipeline run,
+    # so it never drifts out of sync with the actual Silver data
+    audit_df = injected_df.select(
+        "call_id", "attempt_id", "harness", "model_request",
+        "harness_rate", "model_rate", "relative_risk",
+        "injection_probability", "hash_uniform", "is_selected_for_injection"
+    )
+    audit_df.write.format("delta").mode("overwrite").saveAsTable("ledgr.silver.injection_calibration_audit")
+
     priced_df = compute_execution_cost(injected_df)
+    # Note: .cache()/.persist() are NOT supported on Serverless compute 
+    # (NOT_SUPPORTED_WITH_SERVERLESS). At current data volume (265K rows), 
+    # the resulting redundant recomputation across validation steps costs 
+    # seconds, not a real bottleneck for a batch/periodic job. If this ever 
+    # became a genuine cost at larger scale, the correct fix would be writing 
+    # normalized_df to a staging Delta table once and reading that for 
+    # validation, which achieves "compute once, reuse many times" without 
+    # needing .cache()/.persist() at all, and works identically on 
+    # Serverless or Classic compute.
 
     synthetic_df = generate_synthetic_retries(priced_df)
     synthetic_priced_df = compute_execution_cost(synthetic_df.drop("execution_cost_usd"))
