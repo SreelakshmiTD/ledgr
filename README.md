@@ -8,6 +8,10 @@ accuracy or latency in isolation; Ledgr's core metric is spend, attributed
 down to the individual call, so failure and retry cost stop being invisible
 line items and become a number you can compare across harnesses and models.
 
+This project also includes a Databricks/Unity Catalog/dbt implementation
+of the Silver/Gold layers, see [docs/DATABRICKS.md](docs/DATABRICKS.md)
+for details.
+
 ## Data source
 
 The base data is [Exgentic/agent-llm-traces-v2](https://huggingface.co/datasets/Exgentic/agent-llm-traces-v2)
