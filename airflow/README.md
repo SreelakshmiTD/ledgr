@@ -23,6 +23,26 @@ be set (e.g. in a local `.env`) to override the default local paths in
 `docker-compose.yaml` — needed on any machine other than the one those
 defaults were hardcoded for.
 
+## Databricks Job Setup
+
+The DAG references two existing Databricks Jobs by ID (bronze_ingestion:
+job_id=106794160105586, silver_materialize: job_id=736829007447126).
+These must be created manually in the target Databricks workspace before
+the DAG can run:
+
+1. In Databricks, go to Jobs & Pipelines > Create > Job
+2. Create 'ledgr_bronze_ingestion': task type Notebook, path
+   ledgr_databricks/01_bronze_ingestion, cluster Serverless
+3. Create 'ledgr_silver_materialize': task type Notebook, path
+   ledgr_databricks/03_silver_materialize, cluster Serverless
+4. Get each job's ID from the Databricks UI (visible in the job's URL
+   or details panel) and update the job_id values in
+   airflow/dags/ledgr_pipeline_dag.py to match
+
+Note: these job IDs are specific to this project's Databricks workspace
+and will NOT work on a different workspace without recreating the jobs
+and updating the IDs.
+
 ## Known limitations
 
 - **`FERNET_KEY` is not set** (defaults to blank). Acceptable for local
