@@ -1,5 +1,8 @@
 # Ledgr
 
+[![Tests](https://github.com/SreelakshmiTD/ledgr/actions/workflows/tests.yml/badge.svg)](https://github.com/SreelakshmiTD/ledgr/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Ledgr turns raw AI agent execution traces into cost-per-successful-outcome
 data: for a given harness (agent framework) and model, how much does it
 actually cost — in dollars, including the price of failed attempts and
@@ -119,3 +122,7 @@ those files:
   Azure-billed models; this pipeline corrects for that). See
   [`docs/data_dictionary.md`](docs/data_dictionary.md) for the verified
   numbers behind this.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
