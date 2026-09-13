@@ -39,14 +39,24 @@ Raw HuggingFace parquet files (data/raw/*.parquet locally)
 - ledgr.gold.mart_success_outcome_reconciliation — tracks the mismatch
   rate between session-level success and call-level outcome_state,
   excluding synthetic rows (see ADR-0003 and its correction)
-- ledgr.gold.sessions_analyst_view — restricted view (7 of 20+ columns)
-  demonstrating Unity Catalog column-level governance
+- ledgr.gold.sessions_analyst_view — restricted view (9 of 20+ columns):
+  task_id, run_id, harness, benchmark, model_request, provider,
+  outcome_state, execution_cost_usd, is_synthetic_retry — demonstrating
+  Unity Catalog column-level governance
 
 ## Governance
 
 The `ledgr_analysts` group (created via the account console) is granted
 SELECT only on sessions_analyst_view, confirmed via SHOW GRANTS to have
 zero access to the underlying tables.
+
+Note: the GRANT SELECT statement itself and the group creation were done
+directly via the Databricks account console and SQL editor, not as a
+reproducible script in this repo. This is the one part of the project
+that isn't code-first; recreating it requires: (1) creating the
+ledgr_analysts group via Databricks account console, (2) running GRANT
+SELECT ON VIEW ledgr.gold.sessions_analyst_view TO `ledgr_analysts` in a
+SQL editor or notebook.
 
 ## dbt
 
