@@ -1,0 +1,24 @@
+version: 2
+
+models:
+  - name: mart_success_outcome_reconciliation
+    description: >
+      Tracks the mismatch rate between session-level success (task 
+      completion) and call-level outcome_state (execution success), 
+      excluding synthetic retry rows (see ADR-0003). Not expected to 
+      be zero, this is a real, valid distinction between two different 
+      signals, not a bug.
+    columns:
+      - name: total_sessions
+        tests:
+          - not_null
+      - name: mismatch_rate_pct
+        tests:
+          - not_null
+    tests:
+      - dbt_utils.expression_is_true:
+          expression: "mismatch_rate_pct >= 0 AND mismatch_rate_pct <= 100"
+      - dbt_utils.expression_is_true:
+          expression: "mismatched_sessions <= total_sessions"
+      - dbt_utils.expression_is_true:
+          expression: "total_sessions = 10056"
