@@ -63,6 +63,18 @@ SQL editor or notebook.
 Located in ledgr_dbt/. Connects to Databricks via ~/.dbt/profiles.yml
 (not committed). Manages the Gold layer only. Run: `cd ledgr_dbt && dbt run && dbt test`
 
+## Local vs. Databricks cost total discrepancy
+
+Note: a small ~$11 (0.033%) difference exists between the local
+pipeline's total cost ($33,663.00) and the Databricks pipeline's total
+($33,651.89). This is expected: the local pipeline uses zlib.crc32 for
+its deterministic hash-based row selection, while the Databricks/PySpark
+pipeline uses Spark's xxhash64. Both use the same seed and calibration
+formula, but different hash functions select a different specific set of
+rows for synthetic injection, while still hitting the same aggregate
+injection probabilities. This is the expected behavior of two
+independently-implemented, statistically equivalent samples, not a bug.
+
 ## Known limitations
 
 - MERGE-only-insert write pattern: records are immutable once written.
