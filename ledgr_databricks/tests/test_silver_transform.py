@@ -282,13 +282,6 @@ def test_injection_calibration_audit_matches_silver_row_count(spark):
     ).count()
     assert audit_count == real_silver_count
 
-def test_injection_calibration_audit_matches_silver_row_count(spark):
-    audit_count = spark.table("ledgr.silver.injection_calibration_audit").count()
-    real_silver_count = spark.table("ledgr.silver.calls_enriched").filter(
-        F.col("is_synthetic_retry") == False
-    ).count()
-    assert audit_count == real_silver_count
-      
 def test_generate_synthetic_retries_handles_zero_microsecond_timestamp(spark):
     """
     Regression test: real production data can have timestamps with zero 
