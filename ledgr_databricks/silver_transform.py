@@ -206,17 +206,9 @@ def materialize_silver(spark, bronze_table="ledgr.bronze.sessions_raw",
     Full Silver materialization pipeline: explode, normalize, validate config,
     compute injection probability, price, generate synthetic retries, validate
     synthetic rows (fail-loud, blocks write on failure), add outcome state,
-    and write to Delta.
-
-    No manual .cache()/.persist() here despite normalized_df being read
-    multiple times below (by both validate_ calls, then again by the
-    injection/pricing/synthetic-retry chain): this runs on Serverless
-    compute, which manages its own internal caching automatically and does
-    not expose manual cache control to the user. A .cache() call here
-    would not work (Serverless silently ignores or errors on it depending
-    on version) -- this is a genuine platform constraint to design around,
-    not a missing optimization. On classic (non-Serverless) clusters where
-    .cache()/.persist() ARE available, this would be worth revisiting.
+    and write to Delta. The calibration audit table is written AFTER the
+    validation gate, alongside the main write, so a failed run never
+    corrupts the audit trail with data from a run that didn't succeed.
     """
     bronze_df = spark.table(bronze_table)
     exploded_df = explode_bronze_sessions(bronze_df)
@@ -226,26 +218,7 @@ def materialize_silver(spark, bronze_table="ledgr.bronze.sessions_raw",
     validate_pricing_coverage(normalized_df)
 
     injected_df = compute_injection_probability(normalized_df)
-
-    # Persist the calibration audit trail alongside the main pipeline run,
-    # so it never drifts out of sync with the actual Silver data
-    audit_df = injected_df.select(
-        "call_id", "attempt_id", "harness", "model_request",
-        "harness_rate", "model_rate", "relative_risk",
-        "injection_probability", "hash_uniform", "is_selected_for_injection"
-    )
-    audit_df.write.format("delta").mode("overwrite").saveAsTable("ledgr.silver.injection_calibration_audit")
-
     priced_df = compute_execution_cost(injected_df)
-    # Note: .cache()/.persist() are NOT supported on Serverless compute 
-    # (NOT_SUPPORTED_WITH_SERVERLESS). At current data volume (265K rows), 
-    # the resulting redundant recomputation across validation steps costs 
-    # seconds, not a real bottleneck for a batch/periodic job. If this ever 
-    # became a genuine cost at larger scale, the correct fix would be writing 
-    # normalized_df to a staging Delta table once and reading that for 
-    # validation, which achieves "compute once, reuse many times" without 
-    # needing .cache()/.persist() at all, and works identically on 
-    # Serverless or Classic compute.
 
     synthetic_df = generate_synthetic_retries(priced_df)
     synthetic_priced_df = compute_execution_cost(synthetic_df.drop("execution_cost_usd"))
@@ -259,7 +232,17 @@ def materialize_silver(spark, bronze_table="ledgr.bronze.sessions_raw",
         "execution_cost_usd"
     ).withColumn("is_synthetic_retry", F.lit(False))
 
+    # Fail-loud gate: must pass before ANY write happens, including the audit table
     validate_synthetic_retries(synthetic_priced_df, real_final_df)
+
+    # Audit write happens only after validation succeeds, keeping it in sync
+    # with the main Silver table (never records a run that failed validation)
+    audit_df = injected_df.select(
+        "call_id", "attempt_id", "harness", "model_request",
+        "harness_rate", "model_rate", "relative_risk",
+        "injection_probability", "hash_uniform", "is_selected_for_injection"
+    )
+    audit_df.write.format("delta").mode("overwrite").saveAsTable("ledgr.silver.injection_calibration_audit")
 
     combined_df = real_final_df.unionByName(synthetic_priced_df)
     combined_with_state = add_outcome_state(combined_df)
